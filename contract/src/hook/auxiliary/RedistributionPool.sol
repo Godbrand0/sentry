@@ -11,7 +11,7 @@ import {IERC20} from "forge-std/interfaces/IERC20.sol";
 contract RedistributionPool {
     uint64 public constant LONG_TERM_THRESHOLD = 24 hours;
     uint64 public constant MAX_TENURE_CAP = 90 days;
-    uint256 public constant PROTOCOL_FEE_BPS = 500; // 5%
+    uint256 public constant PROTOCOL_FEE_BPS = 769; // ~7.69% of tax = 5% of total fees (60% LP + 5% platform)
 
     address public hook;     // Only SentryHook may register positions and deposit
     address public treasury;

@@ -1,7 +1,7 @@
 // Mirror of the Solidity TaxCurve logic for client-side rendering
 
 const HALF_LIFE = 600; // 10 minutes
-const MAX_TAX_BPS = 9000;
+const MAX_TAX_BPS = 6500;
 const TABLE_DOMAIN = HALF_LIFE * 10; // 6000 seconds
 
 // exp(-k) for k = 0..10
@@ -42,7 +42,7 @@ export function calculateFinalTaxBps(timeHeldSeconds: number, concentrationBps: 
   }
 
   const final = Math.floor((base * multiplierBps) / 10000);
-  return Math.min(9900, final);
+  return Math.min(6500, final);
 }
 
 export function taxPercent(timeHeldSeconds: number, concentrationBps = 0): number {

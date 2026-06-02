@@ -20,31 +20,30 @@ contract TaxCurveTest is Test {
         assertEq(tax, 0, "Far future should be 0");
     }
 
-    function test_oneMinute_approximately84pct() public pure {
+    function test_oneMinute_approximately61pct() public pure {
         // With piecewise-linear interpolation between half-life breakpoints,
-        // 60s → expValue ≈ 0.937 → ~84.3%. True exp(-0.1) = 0.905 but
-        // linear interpolation within the first interval overestimates slightly.
+        // 60s → expValue ≈ 0.937 → 65% * 0.937 ≈ 60.9%
         uint256 tax = TaxCurve.calculateTaxBps(60);
-        assertApproxEqAbs(tax, 8431, 100, "60s tax should be ~84%");
-        assertGt(tax, 8000, "60s tax should be > 80%");
+        assertApproxEqAbs(tax, 6089, 100, "60s tax should be ~61%");
+        assertGt(tax, 5500, "60s tax should be > 55%");
         assertLt(tax, TaxCurve.MAX_TAX_BPS, "60s tax should be below max");
     }
 
     function test_tenMinutes_halfOfMax() public pure {
-        // exp(-1) ≈ 0.368 → 90% * 0.368 ≈ 33.1%
+        // exp(-1) ≈ 0.368 → 65% * 0.368 ≈ 23.9%
         uint256 tax = TaxCurve.calculateTaxBps(600);
-        assertApproxEqAbs(tax, 3311, 300, "10min tax should be ~33%");
+        assertApproxEqAbs(tax, 2391, 300, "10min tax should be ~24%");
     }
 
     function test_thirtyMinutes_low() public pure {
-        // exp(-3) ≈ 0.05 → ~4.5%
+        // exp(-3) ≈ 0.05 → ~3.2%
         uint256 tax = TaxCurve.calculateTaxBps(1800);
-        assertLt(tax, 1000, "30min tax should be < 10%");
+        assertLt(tax, 750, "30min tax should be < 7.5%");
     }
 
     function test_oneHour_veryLow() public pure {
         uint256 tax = TaxCurve.calculateTaxBps(3600);
-        assertLt(tax, 200, "1h tax should be < 2%");
+        assertLt(tax, 150, "1h tax should be < 1.5%");
     }
 
     // ── Monotonic decrease ────────────────────────────────────────────────────────
@@ -67,16 +66,16 @@ contract TaxCurveTest is Test {
         assertEq(base, final_, "Below 50% concentration should not multiply");
     }
 
-    function test_extremeConcentration_capsAt99pct() public pure {
+    function test_extremeConcentration_capsAt65pct() public pure {
         uint256 tax = TaxCurve.calculateFinalTaxBps(0, 10000);
-        assertEq(tax, 9900, "Should cap at 99%");
+        assertEq(tax, 6500, "Should cap at 65%");
     }
 
     function test_highConcentration_multipliesBase() public pure {
         // 0s hold, 90% concentration: score=0.9, multiplier=1+(0.9-0.5)*2=1.8
-        // 90%*1.8 = 162% → capped at 99%
+        // 65%*1.8 = 117% → capped at 65%
         uint256 tax = TaxCurve.calculateFinalTaxBps(0, 9000);
-        assertEq(tax, 9900, "Extreme concentration should hit cap");
+        assertEq(tax, 6500, "Extreme concentration should hit cap");
 
         // 30min hold (~4.5% base tax), 70% concentration: multiplier=1.4 → 4.5%*1.4=6.3%
         uint256 tax2 = TaxCurve.calculateFinalTaxBps(1800, 7000);

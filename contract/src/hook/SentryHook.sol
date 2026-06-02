@@ -41,10 +41,10 @@ contract SentryHook is BaseHook, ISentryHook {
     address public owner;
     address public pendingOwner;
 
-    uint256 public maxTaxBps = 9000;       // 90%
+    uint256 public maxTaxBps = 6500;       // 65% total (60% to LPs + 5% to platform)
     uint256 public halfLife = 600;          // 10 minutes
     uint256 public maxTenureCap = 90 days;
-    uint256 public protocolFeeBps = 500;   // 5%
+    uint256 public protocolFeeBps = 769;   // ~7.69% of tax = 5% of total fees
 
     address public treasury;
     IReputationOracle public reputationOracle;
@@ -236,12 +236,11 @@ contract SentryHook is BaseHook, ISentryHook {
             address token = poolToken0[poolId];
 
             if (taxAmount > 0 && address(rPool) != address(0)) {
-                // Hook takes the tax from the PoolManager by returning a negative delta on token0
-                // (PoolManager interprets: hook owes this amount, reducing LP's received amount)
-                hookDelta = toBalanceDelta(-int128(taxAmount), 0);
+                // Positive hookDelta: callerDelta = callerDelta - hookDelta → LP receives taxAmount less.
+                // PM credits hook taxAmount; hook settles by calling take() to route it to rPool.
+                hookDelta = toBalanceDelta(int128(taxAmount), 0);
 
-                // Transfer from PoolManager to redistribution pool
-                // (In production, this uses PoolManager.take/settle; simplified for scaffold)
+                poolManager.take(key.currency0, address(rPool), taxAmount);
                 rPool.deposit(PoolId.unwrap(poolId), taxAmount);
 
                 pos.feesAccrued += fees0;
@@ -379,9 +378,11 @@ contract SentryHook is BaseHook, ISentryHook {
         view
         returns (uint16)
     {
+        // afterAddLiquidity fires after the position is added, so currentTotal already
+        // includes addedLiquidity. Subtract to recover the pre-add pool depth.
         uint128 currentTotal = StateLibrary.getLiquidity(poolManager, poolId);
-        if (currentTotal == 0) return 0;
-        uint256 score = (uint256(addedLiquidity) * 10000) / (uint256(currentTotal) + uint256(addedLiquidity));
+        if (currentTotal <= addedLiquidity) return 0; // first LP — no prior depth to compare against
+        uint256 score = (uint256(addedLiquidity) * 10000) / uint256(currentTotal);
         return uint16(score > 10000 ? 10000 : score);
     }
 

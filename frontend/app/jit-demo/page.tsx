@@ -143,11 +143,11 @@ export default function JITDemoPage() {
     const tier = getTier(held);
     const baseTax = taxPercent(held, 0);
     const finalTax = taxPercent(held, BOT_CONCENTRATION_BPS);
-    addLog({ type: "tax", text: `base tax: ${baseTax.toFixed(1)}% (exp(-4/600) ≈ 90%)` });
+    addLog({ type: "tax", text: `base tax: ${baseTax.toFixed(1)}% (exp(-4/600) ≈ 65%)` });
     await sleep(400);
     addLog({ type: "tax", text: `concentration score: 91% → multiplier 1.82×` });
     await sleep(400);
-    addLog({ type: "tax", text: `final tax: min(90% × 1.82, 99%) = 99%      `, value: "99%" });
+    addLog({ type: "tax", text: `final tax: min(65% × 1.82, 65%) = 65%      `, value: "65%" });
 
     const tax = Math.floor(BOT_FEES * finalTax / 100);
     const kept = BOT_FEES - tax;

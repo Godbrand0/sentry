@@ -9,7 +9,7 @@ pragma solidity ^0.8.26;
 /// Keeps the contract small and predictable while staying within 5k gas.
 library TaxCurve {
     uint64 internal constant HALF_LIFE = 600;       // 10 minutes
-    uint256 internal constant MAX_TAX_BPS = 9000;   // 90%
+    uint256 internal constant MAX_TAX_BPS = 6500;   // 65% (60% to LPs + 5% to platform)
     uint256 internal constant TABLE_DOMAIN = HALF_LIFE * 10; // 6000 seconds
     uint256 internal constant SCALE = 1e18;
 
@@ -29,7 +29,7 @@ library TaxCurve {
         return 0; // k >= 10
     }
 
-    /// @notice Returns the base tax in basis points (0–9000) for a given hold duration.
+    /// @notice Returns the base tax in basis points (0–6500) for a given hold duration.
     function calculateTaxBps(uint64 timeHeldSeconds) internal pure returns (uint256) {
         if (timeHeldSeconds >= TABLE_DOMAIN) return 0;
 
@@ -46,7 +46,7 @@ library TaxCurve {
         return (MAX_TAX_BPS * expValue) / SCALE;
     }
 
-    /// @notice Applies the concentration multiplier and returns final tax bps, capped at 9900 (99%).
+    /// @notice Applies the concentration multiplier and returns final tax bps, capped at 6500 (65%).
     /// @param concentrationBps Position liquidity as a fraction of total in-range liquidity (0-10000).
     function calculateFinalTaxBps(uint64 timeHeldSeconds, uint16 concentrationBps)
         internal
@@ -63,6 +63,6 @@ library TaxCurve {
         }
 
         uint256 finalTax = (baseTax * multiplierBps) / 10000;
-        return finalTax > 9900 ? 9900 : finalTax;
+        return finalTax > 6500 ? 6500 : finalTax;
     }
 }
