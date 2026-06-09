@@ -10,7 +10,9 @@ import {BeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
-import {IERC20} from "forge-std/interfaces/IERC20.sol";
+
+import {ISubscriber} from "v4-periphery/src/interfaces/ISubscriber.sol";
+import {PositionInfo} from "v4-periphery/src/libraries/PositionInfoLibrary.sol";
 
 import {BaseHook} from "./BaseHook.sol";
 import {ISentryHook} from "./interfaces/ISentryHook.sol";
@@ -20,13 +22,20 @@ import {PositionKey} from "./libraries/PositionKey.sol";
 import {FeeAccounting} from "./libraries/FeeAccounting.sol";
 import {RedistributionPool} from "./auxiliary/RedistributionPool.sol";
 
+interface IERC721Minimal {
+    function ownerOf(uint256 tokenId) external view returns (address);
+}
+
 /// @notice Sentry V4 hook — defends long-term LPs from JIT MEV by taxing short-lived
 /// positions and redistributing captured fees to loyal LPs.
 ///
 /// Hook permission bits required (encode into contract address via CREATE2):
 ///   afterInitialize, afterAddLiquidity, afterRemoveLiquidity, afterSwap,
 ///   afterRemoveLiquidityReturnDelta
-contract SentryHook is BaseHook, ISentryHook {
+///
+/// ISubscriber: LPs using PositionManager can subscribe their NFT for accurate
+/// per-position tracking and correct redistribution attribution.
+contract SentryHook is BaseHook, ISentryHook, ISubscriber {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
     using TaxCurve for uint64;
@@ -52,6 +61,10 @@ contract SentryHook is BaseHook, ISentryHook {
     /// @notice Authorised callers of executeRedistribution (Reactive Network callback gateway).
     mapping(address => bool) public authorizedCallbacks;
 
+    /// @notice V4 PositionManager. When set, subscriber callbacks are accepted from this address
+    /// and `params.salt = bytes32(tokenId)` is used to resolve the actual LP owner.
+    address public positionManager;
+
     // ── Per-position state ──────────────────────────────────────────────────────
 
     mapping(bytes32 => Position) public positions;
@@ -70,12 +83,19 @@ contract SentryHook is BaseHook, ISentryHook {
     // Per-position fee snapshot (to compute fees earned since last touch)
     mapping(bytes32 => FeeAccounting.PositionFeeSnapshot) private _feeSnapshots;
 
+    // ── Subscriber state ────────────────────────────────────────────────────────
+    // tokenId → full PoolId (set on notifySubscribe; used to resolve pool in notifyBurn)
+    mapping(uint256 => PoolId) private _tokenPoolId;
+    // tokenId → actual LP address (NFT owner at subscribe time; updated on modify)
+    mapping(uint256 => address) private _tokenOwner;
+
     // ── Errors ──────────────────────────────────────────────────────────────────
 
     error NotOwner();
     error NotAuthorizedCallback();
     error ProtocolFeeCapExceeded();
     error PoolNotRegistered();
+    error NotPositionManager();
 
     // ── Modifiers ───────────────────────────────────────────────────────────────
 
@@ -86,6 +106,11 @@ contract SentryHook is BaseHook, ISentryHook {
 
     modifier onlyAuthorizedCallback() {
         if (!authorizedCallbacks[msg.sender]) revert NotAuthorizedCallback();
+        _;
+    }
+
+    modifier onlyPositionManager() {
+        if (msg.sender != positionManager) revert NotPositionManager();
         _;
     }
 
@@ -134,7 +159,8 @@ contract SentryHook is BaseHook, ISentryHook {
         poolToken0[poolId] = token0;
 
         RedistributionPool rPool = new RedistributionPool(address(this), treasury);
-        rPool.initPool(PoolId.unwrap(poolId), token0);
+        // Pass the Currency type so RedistributionPool handles both ETH and ERC-20 pools correctly.
+        rPool.initPool(PoolId.unwrap(poolId), key.currency0);
         redistributionPools[poolId] = rPool;
 
         return IHooks.afterInitialize.selector;
@@ -152,8 +178,10 @@ contract SentryHook is BaseHook, ISentryHook {
         if (params.liquidityDelta <= 0) return (IHooks.afterAddLiquidity.selector, BalanceDelta.wrap(0));
 
         PoolId poolId = key.toId();
+        // Use params.salt (not bytes32(0)) so that PositionManager positions, which set
+        // salt = bytes32(tokenId), are keyed uniquely per NFT rather than colliding.
         bytes32 posKey = PositionKey.compute(
-            sender, PoolId.unwrap(poolId), params.tickLower, params.tickUpper, bytes32(0)
+            sender, PoolId.unwrap(poolId), params.tickLower, params.tickUpper, params.salt
         );
 
         uint128 liquidity = uint128(uint256(params.liquidityDelta));
@@ -181,7 +209,8 @@ contract SentryHook is BaseHook, ISentryHook {
                 feeGrowthInside1LastX128: fs.feeGrowthGlobal1X128
             });
 
-            emit PositionOpened(sender, posKey, liquidity, uint64(block.timestamp), concentrationBps);
+            // Emit with the actual LP address (resolved from subscriber state if using PositionManager)
+            emit PositionOpened(_resolveLP(sender, params.salt), posKey, liquidity, uint64(block.timestamp), concentrationBps);
         } else {
             // Existing position: add capital, keep original openedAt (partial re-add).
             pos.capital += liquidity;
@@ -201,12 +230,18 @@ contract SentryHook is BaseHook, ISentryHook {
         bytes calldata
     ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
         PoolId poolId = key.toId();
+        // Use params.salt (not bytes32(0)) — matches the key written in afterAddLiquidity.
+        // PositionManager sets salt = bytes32(tokenId), uniquely identifying each NFT position.
         bytes32 posKey = PositionKey.compute(
-            sender, PoolId.unwrap(poolId), params.tickLower, params.tickUpper, bytes32(0)
+            sender, PoolId.unwrap(poolId), params.tickLower, params.tickUpper, params.salt
         );
 
         Position storage pos = positions[posKey];
         if (pos.openedAt == 0) return (IHooks.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
+
+        // Resolve the actual LP address: if sender is PositionManager and the tokenId (salt)
+        // is subscribed, use the stored NFT owner; otherwise fall back to sender.
+        address lp = _resolveLP(sender, params.salt);
 
         uint64 timeHeld = uint64(block.timestamp) - pos.openedAt;
         uint128 removedLiquidity = uint128(uint256(-params.liquidityDelta));
@@ -223,7 +258,7 @@ contract SentryHook is BaseHook, ISentryHook {
         uint256 taxBps = TaxCurve.calculateFinalTaxBps(timeHeld, pos.concentrationBps);
 
         // Apply cross-chain reputation discount: global tenure can reduce effective tax.
-        taxBps = _applyReputationDiscount(sender, taxBps);
+        taxBps = _applyReputationDiscount(lp, taxBps);
 
         uint128 taxAmount = 0;
         BalanceDelta hookDelta = BalanceDelta.wrap(0);
@@ -233,7 +268,6 @@ contract SentryHook is BaseHook, ISentryHook {
 
             // Route tax: take token0 from the LP's payout, send to RedistributionPool
             RedistributionPool rPool = redistributionPools[poolId];
-            address token = poolToken0[poolId];
 
             if (taxAmount > 0 && address(rPool) != address(0)) {
                 // Positive hookDelta: callerDelta = callerDelta - hookDelta → LP receives taxAmount less.
@@ -252,12 +286,12 @@ contract SentryHook is BaseHook, ISentryHook {
         bool isFullClose = pos.capital <= removedLiquidity;
 
         if (isFullClose) {
-            emit PositionClosed(sender, posKey, pos.capital, timeHeld, fees0, taxAmount);
+            emit PositionClosed(lp, posKey, pos.capital, timeHeld, fees0, taxAmount);
 
-            // Deregister from redistribution eligibility
+            // Deregister from redistribution eligibility using the resolved LP address
             RedistributionPool rPool = redistributionPools[poolId];
             if (address(rPool) != address(0)) {
-                rPool.deregisterEligibleLP(PoolId.unwrap(poolId), sender, pos.openedAt);
+                rPool.deregisterEligibleLP(PoolId.unwrap(poolId), lp, pos.openedAt);
             }
 
             delete positions[posKey];
@@ -271,11 +305,11 @@ contract SentryHook is BaseHook, ISentryHook {
             _feeSnapshots[posKey].feeGrowthInside1LastX128 = _feeState[poolId].feeGrowthGlobal1X128;
         }
 
-        // Register as eligible long-term LP if just crossed the threshold on close
+        // Register as eligible long-term LP if just crossed the threshold on partial removal
         if (!isFullClose && timeHeld >= LONG_TERM_THRESHOLD) {
             RedistributionPool rPool = redistributionPools[poolId];
             if (address(rPool) != address(0)) {
-                rPool.registerEligibleLP(PoolId.unwrap(poolId), sender, pos.capital, pos.openedAt);
+                rPool.registerEligibleLP(PoolId.unwrap(poolId), lp, pos.capital, pos.openedAt);
             }
         }
 
@@ -308,6 +342,57 @@ contract SentryHook is BaseHook, ISentryHook {
         FeeAccounting.accumulateFees(_feeState[poolId], fee0, fee1, totalLiquidity);
 
         return (IHooks.afterSwap.selector, 0);
+    }
+
+    // ── ISubscriber ─────────────────────────────────────────────────────────────
+    //
+    // LPs using the V4 PositionManager can subscribe their NFT to SentryHook.
+    // The PositionManager passes salt = bytes32(tokenId) into every modifyLiquidity call,
+    // so hook callbacks and subscriber callbacks share the same position key.
+    //
+    // Subscription flow:
+    //   1. LP calls PositionManager.subscribe(tokenId, address(this), abi.encode(poolId))
+    //   2. notifySubscribe records tokenId → actual LP owner + poolId
+    //   3. All subsequent hook callbacks resolve the true LP via _resolveLP()
+    //   4. On burn, notifyBurn cleans up subscriber state
+
+    function notifySubscribe(uint256 tokenId, bytes memory data) external onlyPositionManager {
+        PoolId poolId = abi.decode(data, (PoolId));
+        _tokenPoolId[tokenId] = poolId;
+        // Record who owns the NFT at subscription time for correct redistribution attribution
+        _tokenOwner[tokenId] = IERC721Minimal(positionManager).ownerOf(tokenId);
+        emit SubscriberRegistered(tokenId, _tokenOwner[tokenId], PoolId.unwrap(poolId));
+    }
+
+    function notifyUnsubscribe(uint256 tokenId) external onlyPositionManager {
+        // Gas is capped for this call (EIP-150 / unsubscribeGasLimit). Keep it minimal.
+        address lp = _tokenOwner[tokenId];
+        _tokenPoolId[tokenId] = PoolId.wrap(bytes32(0));
+        delete _tokenOwner[tokenId];
+        emit SubscriberDeregistered(tokenId, lp);
+    }
+
+    /// @notice Called by PositionManager when the subscribed position modifies liquidity or collects fees.
+    /// Used to keep the stored LP address current in case the NFT was transferred.
+    function notifyModifyLiquidity(uint256 tokenId, int256, BalanceDelta) external onlyPositionManager {
+        // If the NFT has changed hands since subscribe, update the stored owner so that
+        // redistribution rewards always target the current holder.
+        address currentOwner = IERC721Minimal(positionManager).ownerOf(tokenId);
+        if (_tokenOwner[tokenId] != currentOwner) {
+            _tokenOwner[tokenId] = currentOwner;
+        }
+    }
+
+    /// @notice Called by PositionManager when the subscribed position is burned.
+    /// The hook's afterRemoveLiquidity has already applied the tax (it runs inside unlock).
+    /// This callback fires outside unlock and handles subscriber-state cleanup.
+    function notifyBurn(uint256 tokenId, address burnOwner, PositionInfo, uint256, BalanceDelta)
+        external
+        onlyPositionManager
+    {
+        emit SubscriberDeregistered(tokenId, burnOwner);
+        _tokenPoolId[tokenId] = PoolId.wrap(bytes32(0));
+        delete _tokenOwner[tokenId];
     }
 
     // ── Redistribution ──────────────────────────────────────────────────────────
@@ -352,6 +437,10 @@ contract SentryHook is BaseHook, ISentryHook {
         treasury = _treasury;
     }
 
+    function setPositionManager(address pm) external onlyOwner {
+        positionManager = pm;
+    }
+
     function authorizeCallback(address sender) external onlyOwner {
         authorizedCallbacks[sender] = true;
     }
@@ -371,6 +460,15 @@ contract SentryHook is BaseHook, ISentryHook {
     }
 
     // ── Internal helpers ────────────────────────────────────────────────────────
+
+    /// @dev Resolve the true LP address for redistribution attribution.
+    /// When using the V4 PositionManager, `sender` is the PM contract and `salt = bytes32(tokenId)`.
+    /// If the tokenId is subscribed, return the stored NFT owner; otherwise return sender as-is.
+    function _resolveLP(address sender, bytes32 salt) internal view returns (address) {
+        if (sender != positionManager || positionManager == address(0)) return sender;
+        address subscribedOwner = _tokenOwner[uint256(salt)];
+        return subscribedOwner != address(0) ? subscribedOwner : sender;
+    }
 
     /// @dev Concentration score: position liquidity as a fraction of current pool in-range liquidity.
     function _computeConcentrationBps(PoolId poolId, uint128 addedLiquidity)

@@ -39,6 +39,12 @@ interface ISentryHook {
 
     event RedistributionReceived(address indexed lp, bytes32 indexed poolId, uint128 amount);
 
+    // Emitted when an LP subscribes their PositionManager NFT to Sentry for opt-in tracking.
+    event SubscriberRegistered(uint256 indexed tokenId, address indexed lp, bytes32 poolId);
+
+    // Emitted when a subscribed position is closed or unsubscribed.
+    event SubscriberDeregistered(uint256 indexed tokenId, address indexed lp);
+
     function getPosition(bytes32 positionKey) external view returns (Position memory);
 
     function calculateTax(uint64 timeHeld, uint16 concentrationBps) external view returns (uint256);

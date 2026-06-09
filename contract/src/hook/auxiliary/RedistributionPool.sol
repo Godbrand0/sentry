@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {IERC20} from "forge-std/interfaces/IERC20.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 
 /// @notice Per-pool accumulator for taxed fees. Settles to eligible long-term LPs
 /// when triggered by the Reactive RedistributionScheduler or anyone calling execute().
@@ -9,6 +9,8 @@ import {IERC20} from "forge-std/interfaces/IERC20.sol";
 /// Eligibility: continuously held > 24h (LONG_TERM_THRESHOLD).
 /// Share: lp_score = capital × min(tenure, MAX_TENURE_CAP)
 contract RedistributionPool {
+    using CurrencyLibrary for Currency;
+
     uint64 public constant LONG_TERM_THRESHOLD = 24 hours;
     uint64 public constant MAX_TENURE_CAP = 90 days;
     uint256 public constant PROTOCOL_FEE_BPS = 769; // ~7.69% of tax = 5% of total fees (60% LP + 5% platform)
@@ -23,7 +25,7 @@ contract RedistributionPool {
     }
 
     struct PoolAccumulator {
-        address token;
+        Currency currency;      // Supports both ERC-20 and native ETH pools
         uint128 balance;
         uint64 lastRedistributionAt;
         EligibleLP[] eligibleLPs;
@@ -45,9 +47,9 @@ contract RedistributionPool {
         treasury = _treasury;
     }
 
-    /// @notice Register a pool's reward token. Called by hook on afterInitialize.
-    function initPool(bytes32 poolId, address token) external onlyHook {
-        _pools[poolId].token = token;
+    /// @notice Register a pool's reward currency. Called by hook on afterInitialize.
+    function initPool(bytes32 poolId, Currency currency) external onlyHook {
+        _pools[poolId].currency = currency;
     }
 
     /// @notice Register a new long-term-eligible LP. Called by hook when position crosses threshold.
@@ -88,9 +90,9 @@ contract RedistributionPool {
         pool.balance = 0;
         pool.lastRedistributionAt = uint64(block.timestamp);
 
-        // Send protocol fee to treasury
+        // Send protocol fee to treasury (handles both ETH and ERC-20 pools)
         if (protocolFee > 0) {
-            IERC20(pool.token).transfer(treasury, protocolFee);
+            pool.currency.transfer(treasury, protocolFee);
         }
 
         // Compute LP scores and total
@@ -98,7 +100,7 @@ contract RedistributionPool {
         uint256 n = lps.length;
         if (n == 0) {
             // No eligible LPs — return funds to protocol treasury rather than locking
-            IERC20(pool.token).transfer(treasury, toDistribute);
+            pool.currency.transfer(treasury, toDistribute);
             emit Redistributed(poolId, 0, protocolFee + toDistribute, 0);
             return;
         }
@@ -117,7 +119,7 @@ contract RedistributionPool {
             if (scores[i] == 0) continue;
             uint128 payout = uint128((uint256(toDistribute) * scores[i]) / totalScore);
             if (payout == 0) continue;
-            IERC20(pool.token).transfer(lps[i].lp, payout);
+            pool.currency.transfer(lps[i].lp, payout);
             totalPaid += payout;
             emit LPPaid(poolId, lps[i].lp, payout);
         }
